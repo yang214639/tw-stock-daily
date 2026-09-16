@@ -1,0 +1,74 @@
+name: 台股盤勢資料管線
+
+on:
+  schedule:
+    # UTC 時間。14:00 UTC = 台灣 22:00,此時當日收盤價、三大法人、
+    # 融資融券餘額都已公布。週一到週五執行(台灣週六日無盤)。
+    - cron: "0 14 * * 1-5"
+  workflow_dispatch:          # 可在 Actions 頁面手動按鈕執行
+    inputs:
+      full_refresh:
+        description: "忽略快取,重抓完整歷史(第一次或快取壞掉時用)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write             # 允許把 daily.json commit 回 repo
+
+concurrency:
+  group: twstock-daily
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安裝套件
+        run: pip install --quiet "pandas==2.2.3" "numpy==2.1.3"   # 釘版本,避免上游改版或供應鏈風險
+
+      - name: 檢查 config.json
+        run: python fetch_and_compute.py --check-config
+
+      - name: 指標自我驗算(兩套獨立實作交叉比對)
+        run: python fetch_and_compute.py --selftest
+
+      - name: 抓取並計算
+        id: run
+        env:
+          # 可選:到 finmindtrade.com 註冊免費帳號拿 token,流量上限較高。
+          # 沒設定也能跑(匿名),只是比較容易遇到流量限制。
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          if [ "${{ inputs.full_refresh }}" = "true" ]; then
+            python fetch_and_compute.py --full-refresh
+          else
+            python fetch_and_compute.py
+          fi
+
+      - name: Commit 結果
+        if: always()
+        run: |
+          git config user.name  "twstock-bot"
+          git config user.email "twstock-bot@users.noreply.github.com"
+          git add -A daily.json data/ || true
+          if git diff --cached --quiet; then
+            echo "沒有變更,略過 commit"
+          else
+            git commit -m "data: $(date -u '+%Y-%m-%d %H:%M UTC') 盤勢資料更新"
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && break || sleep 5
+            done
+          fi
+
+      - name: 失敗時顯示未取得資料
+        if: failure()
+        run: |
+          echo "::warning::資料管線失敗,daily.json 可能未更新"
+          test -f daily.json && python -c "import json;d=json.load(open('daily.json'));print(d.get('pipeline_error'));print(d.get('missing'))" || true
