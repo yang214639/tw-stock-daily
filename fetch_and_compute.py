@@ -614,8 +614,14 @@ def reduce_signals(t: dict, inst: dict, mg: dict, per: dict,
     return s
 
 
-def entry_signals(t: dict, inst: dict, mg: dict, per: dict, bench: dict) -> dict:
-    """0050 專用:進場訊號(打勾 = 對進場有利)"""
+def entry_signals(t: dict, inst: dict, mg: dict, per: dict, bench: dict,
+                  is_etf: bool = True) -> dict:
+    """進場訊號(打勾 = 對進場有利)。
+
+    由 0050(反向觀察)與每日新選標的共用。is_etf 只影響兩個項目的說明文字
+    與折溢價項的適用性說明,不改變任何機械判定邏輯 —— 因此 0050 的訊號
+    輸出與改動前完全相同。
+    """
     s = {}
     c = t["close"]
     ma20, ma60 = t["ma"].get("20"), t["ma"].get("60")
@@ -675,10 +681,14 @@ def entry_signals(t: dict, inst: dict, mg: dict, per: dict, bench: dict) -> dict
             None if not dy else None,
             f"最新殖利率 {dy}%(近一年百分位未計算:FinMind 殖利率序列未另抓)")
     else:
-        s["本益比位於近一年偏低區間(P30以下)"] = S(None, "TaiwanStockPER 查無 ETF 資料")
+        s["本益比位於近一年偏低區間(P30以下)"] = S(
+            None, "TaiwanStockPER 查無 ETF 資料" if is_etf
+            else "TaiwanStockPER 查無資料")
         s["殖利率位於近一年偏高區間"] = S(None, "查無資料")
 
-    s["ETF 折溢價出現折價或溢價收斂"] = S(None, "未串接 ETF 淨值/折溢價來源,查無資料")
+    s["ETF 折溢價出現折價或溢價收斂"] = S(
+        None, "未串接 ETF 淨值/折溢價來源,查無資料" if is_etf
+        else "非 ETF,折溢價不適用(本項對個股恆為資料不足,不應計入證據面)")
 
     pc = t.get("bias60_pctile_1y")
     s["負乖離過大(季線乖離近一年P20以下)"] = S(
@@ -1154,7 +1164,7 @@ def main() -> int:
         }
         if is_etf:
             rec["revenue_note"] = "ETF 無月營收,不適用"
-            sig = entry_signals(t, inst, mg, per, bench)
+            sig = entry_signals(t, inst, mg, per, bench, is_etf=True)
             hits, nd, tot = count_hits(sig)
             rec["signal_type"] = "entry"
             rec["signals"] = sig
@@ -1180,7 +1190,11 @@ def main() -> int:
     log("開始每日篩選")
     scr = run_screen(cfg, today, bench, exclude, sleep, a.full_refresh)
 
-    # 每日新選標的同樣要做減碼訊號檢核,並併入 stocks 讓報告端處理方式一致
+    # 每日新選標的:主檢核改為「進場訊號」——它是還沒買進的標的,
+    # 該回答的是「要不要進、在什麼價位進」,而減碼清單問的是「該不該減」,
+    # 對一檔尚未持有的標的資訊量低(例如「本益比是否過高」對便宜股永遠為 False)。
+    # 但減碼檢核仍然保留在 reduce_signals/reduce_summary:它是
+    # 「被篩選挑中、卻已經在劣化」的守門,不能因為換主檢核就丟掉。
     if scr.get("selected"):
         sel = scr["selected"]
         sid = sel["id"]
@@ -1191,20 +1205,30 @@ def main() -> int:
             divergence(rows, t)
             mg = compute_margin(sid, today, sleep)
             rev = compute_revenue(sid, today, sleep)
-            sig = reduce_signals(t, sel.get("inst") or {}, mg, sel.get("per") or {},
-                                 rev, bench)
-            hits, nd, tot = count_hits(sig)
+            inst = sel.get("inst") or {}
+            per = sel.get("per") or {}
+            esig = entry_signals(t, inst, mg, per, bench, is_etf=False)
+            ehit, end, etot = count_hits(esig)
+            rsig = reduce_signals(t, inst, mg, per, rev, bench)
+            rhit, rnd, rtot = count_hits(rsig)
+            log(f"新選標的 {sid} 進場檢核 {ehit}/{etot}、減碼守門 {rhit}/{rtot}")
             out["stocks"][sid] = {
                 "name": sel["name"], "market": "twse/tpex(篩選標的)",
-                "note": f"每日新選標的(路徑{sel['path']})",
+                "note": f"每日新選標的(路徑{sel['path']});主檢核為進場訊號,"
+                        f"另附 reduce_signals 作為劣化守門",
                 "is_daily_pick": True,
                 "single_source": False,
                 "price_gap_warning": detect_price_gap(rows, cfg["screen"]["price_gap_abs_pct"]),
                 "tech": {k: v for k, v in t.items() if not k.startswith("_")},
                 "inst": sel.get("inst"), "margin": mg or None,
                 "per": sel.get("per"), "revenue": rev or None,
-                "signal_type": "reduce", "signals": sig,
-                "signal_summary": {"hit": hits, "no_data": nd, "total": tot},
+                "signal_type": "entry", "signals": esig,
+                "signal_summary": {"hit": ehit, "no_data": end, "total": etot},
+                "entry_zone": etf_entry_zone(t),
+                "zone_hint": zone_hint(t, ehit, etot),
+                # 劣化守門:選進來但已在轉壞的情況必須看得到
+                "reduce_signals": rsig,
+                "reduce_summary": {"hit": rhit, "no_data": rnd, "total": rtot},
             }
             sel.pop("tech", None)      # 已併入 stocks,避免重複佔空間
             sel.pop("inst", None)
